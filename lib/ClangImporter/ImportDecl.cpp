@@ -15,8 +15,8 @@
 //===----------------------------------------------------------------------===//
 
 #include "CFTypeInfo.h"
-#include "ImporterImpl.h"
 #include "ClangDerivedConformances.h"
+#include "ImporterImpl.h"
 #include "SwiftDeclSynthesizer.h"
 #include "swift/AST/ASTContext.h"
 #include "swift/AST/Attr.h"
@@ -3372,6 +3372,21 @@ namespace {
       return true;
     }
 
+    static bool
+    implicitObjectParamIsLifetimeBound(const clang::FunctionDecl *FD) {
+      const clang::TypeSourceInfo *TSI = FD->getTypeSourceInfo();
+      if (!TSI)
+        return false;
+      clang::AttributedTypeLoc ATL;
+      for (clang::TypeLoc TL = TSI->getTypeLoc();
+           (ATL = TL.getAsAdjusted<clang::AttributedTypeLoc>());
+           TL = ATL.getModifiedLoc()) {
+        if (ATL.getAttrAs<clang::LifetimeBoundAttr>())
+          return true;
+      }
+      return false;
+    }
+
     Decl *importFunctionDecl(
         const clang::FunctionDecl *decl, ImportedName importedName,
         std::optional<ImportedName> correctSwiftName,
@@ -3678,8 +3693,12 @@ namespace {
         if (!dc->isModuleScopeContext()) {
           if (selfIsInOut)
             func->setSelfAccessKind(SelfAccessKind::Mutating);
-          else
-            func->setSelfAccessKind(SelfAccessKind::NonMutating);
+          else {
+            if (implicitObjectParamIsLifetimeBound(decl))
+              func->setSelfAccessKind(SelfAccessKind::Borrowing);
+            else
+              func->setSelfAccessKind(SelfAccessKind::NonMutating);
+          }
           if (selfIdx) {
             func->setSelfIndex(selfIdx.value());
           } else {
@@ -3723,6 +3742,55 @@ namespace {
       // Set availability.
       if (decl->isVariadic()) {
         Impl.markUnavailable(result, "Variadic function is unavailable");
+      }
+
+      auto swiftParams = result->getParameters();
+      bool hasSelf = result->hasImplicitSelfDecl();
+      SmallVector<LifetimeDependenceInfo, 1> lifetimeDependencies;
+      SmallBitVector inheritLifetimeParamIndicesForReturn(swiftParams->size() +
+                                                          hasSelf);
+      SmallBitVector scopedLifetimeParamIndicesForReturn(swiftParams->size() +
+                                                         hasSelf);
+      for (auto [idx, param] : llvm::enumerate(decl->parameters())) {
+        if (param->hasAttr<clang::LifetimeBoundAttr>()) {
+          if (swiftParams->get(idx)->getInterfaceType()->isEscapable())
+            scopedLifetimeParamIndicesForReturn[idx] = true;
+          else
+            inheritLifetimeParamIndicesForReturn[idx] = true;
+        }
+      }
+      if (implicitObjectParamIsLifetimeBound(decl)) {
+        auto idx = result->getSelfIndex();
+        if (result->getImplicitSelfDecl()->getInterfaceType()->isEscapable())
+          scopedLifetimeParamIndicesForReturn[idx] = true;
+        else
+          inheritLifetimeParamIndicesForReturn[idx] = true;
+      }
+
+      if (inheritLifetimeParamIndicesForReturn.any() ||
+          scopedLifetimeParamIndicesForReturn.any())
+        lifetimeDependencies.push_back(LifetimeDependenceInfo(
+            inheritLifetimeParamIndicesForReturn.any()
+                ? IndexSubset::get(Impl.SwiftContext,
+                                   inheritLifetimeParamIndicesForReturn)
+                : nullptr,
+            scopedLifetimeParamIndicesForReturn.any()
+                ? IndexSubset::get(Impl.SwiftContext,
+                                   scopedLifetimeParamIndicesForReturn)
+                : nullptr,
+            swiftParams->size(),
+            /*isImmortal*/ false));
+      else if (auto *ctordecl = dyn_cast<clang::CXXConstructorDecl>(decl)) {
+        // Assume default constructed view types have no dependencies.
+        if (ctordecl->isDefaultConstructor() &&
+            importer::hasNonEscapableAttr(ctordecl->getParent()))
+          lifetimeDependencies.push_back(
+              LifetimeDependenceInfo(nullptr, nullptr, 0, /*isImmortal*/ true));
+      }
+      if (!lifetimeDependencies.empty()) {
+        Impl.SwiftContext.evaluator.cacheOutput(
+            LifetimeDependenceInfoRequest{result},
+            Impl.SwiftContext.AllocateCopy(lifetimeDependencies));
       }
 
       if (decl->hasAttr<clang::ReturnsTwiceAttr>()) {
